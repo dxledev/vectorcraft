@@ -236,6 +236,8 @@ struct Applied {
     brightness: Brightness,
     accent: Accent,
     scheme: Scheme,
+    /// Which reading of the desktop theme's colours the Desktop scheme was last built from.
+    desktop_theme: u64,
     /// User Interface › Canvas Color, unless it matches the interface brightness.
     canvas: Option<egui::Color32>,
     threads: i32,
@@ -270,10 +272,16 @@ fn apply(app: &mut VectorcraftApp, ctx: &egui::Context, force: bool) {
     {
         app.ui.brightness = b;
     }
+    let scheme = Scheme::parse(&p.ui_color_scheme).unwrap_or_default();
+    if scheme == Scheme::Desktop {
+        // Start following the desktop theme; its changes wake the UI and move the generation below.
+        crate::desktop_theme::watch(ctx);
+    }
     let want = Applied {
         brightness: app.ui.brightness,
         accent: Accent::parse(&p.ui_accent).unwrap_or_default(),
-        scheme: Scheme::parse(&p.ui_color_scheme).unwrap_or_default(),
+        scheme,
+        desktop_theme: if scheme == Scheme::Desktop { crate::desktop_theme::generation() } else { 0 },
         canvas: canvas_color(&p.canvas_color),
         threads: p.render_threads,
         tool_tips: p.show_tool_tips,

@@ -33,6 +33,7 @@ pub mod control;
 pub mod credits;
 pub mod cursors;
 mod custom_toolbars;
+pub mod desktop_theme;
 pub mod dialogs;
 pub mod doc_windows;
 pub mod dock;

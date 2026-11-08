@@ -85,22 +85,25 @@ impl Accent {
     }
 }
 
-/// User Interface › Color Scheme: Modern (the default: slate greys and the chosen accent) or
-/// Classic (the neutral greys and blue accent of earlier versions). Both keep the same layout,
-/// cards and corners; only the colours differ.
+/// User Interface › Color Scheme: Modern (slate greys and the chosen accent), Classic (the
+/// neutral greys and blue accent of earlier versions) or Desktop (the colours of the desktop's
+/// theme, followed as it changes; Modern where there is none). All keep the same layout, cards and
+/// corners; only the colours differ.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scheme {
     #[default]
     Modern,
     Classic,
+    Desktop,
 }
 
 impl Scheme {
-    pub const ALL: [Scheme; 2] = [Scheme::Modern, Scheme::Classic];
+    pub const ALL: [Scheme; 3] = [Scheme::Modern, Scheme::Classic, Scheme::Desktop];
     pub fn id(self) -> &'static str {
         match self {
             Scheme::Modern => "modern",
             Scheme::Classic => "classic",
+            Scheme::Desktop => "desktop",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -127,6 +130,8 @@ pub struct Tokens {
     pub tool_active: Color32,
     pub accent: Color32,
     pub accent_strong: Color32,
+    /// Lettering and marks on a fill of `accent` or `accent_strong` (white unless the accent is pale).
+    pub on_accent: Color32,
     pub row_selected: Color32,
     pub pasteboard: Color32,
     pub ruler: Color32,
@@ -192,6 +197,7 @@ impl Tokens {
             tool_active: hex(0x2f3541),
             accent: hex(0xf06a52),
             accent_strong: hex(0xe8573f),
+            on_accent: Color32::WHITE,
             row_selected: hex(0x3a2a2c),
             pasteboard: hex(0x101217),
             ruler: hex(0x13161c),
@@ -422,11 +428,16 @@ impl Tokens {
         }
     }
 
-    /// The tokens for `b` in `scheme`; Modern takes `accent`, Classic has its own blue.
+    /// The tokens for `b` in `scheme`; Modern takes `accent`, Classic has its own blue, and Desktop
+    /// takes the desktop theme's colours (Modern when the desktop has none), whatever `b` and `accent`.
     pub fn for_scheme(scheme: Scheme, b: Brightness, accent: Accent) -> Self {
         match scheme {
             Scheme::Modern => Self::for_brightness(b).with_accent(accent),
             Scheme::Classic => Self::classic(b),
+            Scheme::Desktop => match crate::desktop_theme::palette() {
+                Some(palette) => Self::desktop(&palette),
+                None => Self::for_brightness(b).with_accent(accent),
+            },
         }
     }
 
@@ -435,19 +446,87 @@ impl Tokens {
     pub fn with_accent(self, accent: Accent) -> Self {
         let hex = |s: u32| Color32::from_rgb((s >> 16) as u8, (s >> 8) as u8, s as u8);
         let (a, strong) = accent.colors(self.dark);
-        let (a, strong) = (hex(a), hex(strong));
-        let tint = |k: f32| {
-            let mix = |p: u8, q: u8| (f32::from(p) + (f32::from(q) - f32::from(p)) * k).round() as u8;
-            Color32::from_rgb(mix(self.panel.r(), a.r()), mix(self.panel.g(), a.g()), mix(self.panel.b(), a.b()))
-        };
+        self.with_accent_colors(hex(a), hex(strong), Color32::WHITE)
+    }
+
+    /// These tokens with `accent` and `strong` (the fill of buttons, under `on` lettering).
+    fn with_accent_colors(self, a: Color32, strong: Color32, on: Color32) -> Self {
+        let tint = |k: f32| mix(self.panel, a, k);
         Tokens {
             accent: a,
             accent_strong: strong,
+            on_accent: on,
             flyout_active: if self.dark { a } else { strong },
             row_selected: tint(if self.dark { 0.24 } else { 0.2 }),
             tool_active: tint(if self.dark { 0.3 } else { 0.24 }),
             ..self
         }
+    }
+
+    /// The tokens for a desktop theme's `palette`: its background, text and primary colour, with the
+    /// surfaces, borders and dimmed text between them derived, so any theme (dark or light, pale or
+    /// saturated primary) keeps the contrast the UI needs. Colours that belong to the document rather
+    /// than the interface (guides, selection, bleed, gizmo axes) stay as the brightness has them.
+    pub fn desktop(palette: &crate::desktop_theme::DesktopPalette) -> Self {
+        let rgb = |c: crate::desktop_theme::Rgb| Color32::from_rgb(c[0], c[1], c[2]);
+        let (bg, fg) = (rgb(palette.background), rgb(palette.foreground));
+        let dark = luminance(bg) < luminance(fg);
+        let ink = if dark { Color32::WHITE } else { Color32::BLACK };
+        // A foreground too close to the background is pushed apart from it first.
+        let fg = readable(fg, bg, 4.5, ink);
+        let base = Self::for_brightness(if dark { Brightness::MediumDark } else { Brightness::Light });
+        let (white, black) = (Color32::WHITE, Color32::BLACK);
+        // The cards need a panel that differs from the app bar: the theme's own step when it has one.
+        let panel = match palette.surface.map(rgb) {
+            Some(s) if contrast(s, bg) >= 1.08 => s,
+            _ => mix(bg, fg, 0.07),
+        };
+        // Text, dimmed text and the rest of the lettering, each readable on the panel.
+        let text = readable(fg, panel, 7.0, ink);
+        let text_dim = readable(mix(panel, text, 0.62), panel, 4.5, text);
+        let text_disabled = mix(panel, text, 0.38);
+        // The accent shows up as text, outlines and marks on the panel: pull it towards the text
+        // colour until it reads there. Fills keep it as it is and put the lettering that fits on top.
+        let accent = readable(rgb(palette.primary), panel, 3.0, text);
+        let on = [white, Color32::from_rgb(0x12, 0x12, 0x12)]
+            .into_iter()
+            .max_by(|a, b| contrast(*a, accent).total_cmp(&contrast(*b, accent)))
+            .unwrap_or(white);
+        // The resting fill of buttons: the accent moved away from its lettering until that reads.
+        let strong =
+            readable_on(mix(accent, if dark { bg } else { black }, if dark { 0.18 } else { 0.12 }), on, 4.5, if on == white { black } else { white });
+        let (hover, button, input_border, divider, button_border) =
+            (mix(panel, fg, 0.09), mix(panel, fg, 0.12), mix(panel, fg, 0.2), mix(panel, fg, 0.1), mix(panel, fg, 0.36));
+        let panel_darker = mix(panel, bg, 0.6);
+        let shade = |c: Color32, k: f32| mix(c, if dark { black } else { white }, k);
+        Tokens {
+            dark,
+            app_bar: bg,
+            panel,
+            panel_darker,
+            tab_strip: mix(bg, panel, 0.35),
+            input: if dark { shade(panel, 0.4) } else { mix(panel, white, 0.6) },
+            input_border,
+            border: if dark { shade(bg, 0.5) } else { mix(panel, fg, 0.16) },
+            divider,
+            text,
+            text_strong: mix(text, if dark { white } else { black }, 0.6),
+            text_dim,
+            text_disabled,
+            icon: mix(panel, text, 0.88),
+            hover,
+            tool_active: mix(panel, fg, 0.16),
+            pasteboard: if dark { shade(panel, 0.3) } else { mix(panel, fg, 0.06) },
+            ruler: panel_darker,
+            ruler_tick: text_dim,
+            measure_bg: Color32::from_rgba_unmultiplied(panel.r(), panel.g(), panel.b(), 235),
+            button,
+            button_border,
+            error: palette.danger.map(rgb).map_or(base.error, |c| readable(c, panel, 3.0, text)),
+            warning: palette.warning.map(rgb).map_or(base.warning, |c| readable(c, panel, 3.0, text)),
+            ..base
+        }
+        .with_accent_colors(accent, strong, on)
     }
 
     pub fn get(ctx: &egui::Context) -> Tokens {
@@ -456,6 +535,37 @@ impl Tokens {
     pub fn cr(&self) -> CornerRadius {
         CornerRadius::same(self.radius)
     }
+}
+
+/// `a` towards `b` by `k` (0 is `a`, 1 is `b`), per channel.
+fn mix(a: Color32, b: Color32, k: f32) -> Color32 {
+    let channel = |p: u8, q: u8| (f32::from(p) + (f32::from(q) - f32::from(p)) * k).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(channel(a.r(), b.r()), channel(a.g(), b.g()), channel(a.b(), b.b()))
+}
+
+/// WCAG relative luminance of an opaque colour.
+fn luminance(c: Color32) -> f32 {
+    let channel = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+}
+
+/// The WCAG contrast ratio of two opaque colours, 1 (the same) to 21 (black on white).
+fn contrast(a: Color32, b: Color32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `fill`, or the first mix of it towards `towards` that `on` reaches `ratio` against.
+fn readable_on(fill: Color32, on: Color32, ratio: f32, towards: Color32) -> Color32 {
+    (0..=10).map(|step| mix(fill, towards, step as f32 / 10.0)).find(|m| contrast(on, *m) >= ratio).unwrap_or(towards)
+}
+
+/// `c`, or the first mix of it towards `towards` that reaches `ratio` against `background`.
+fn readable(c: Color32, background: Color32, ratio: f32, towards: Color32) -> Color32 {
+    (0..=10).map(|step| mix(c, towards, step as f32 / 10.0)).find(|m| contrast(*m, background) >= ratio).unwrap_or(towards)
 }
 
 /// The toolbar, the panel dock and the icon rail are cards: `body` drawn on the panel colour with
@@ -599,6 +709,9 @@ pub fn apply(ctx: &egui::Context, b: Brightness) {
 
 /// [`apply`] with an accent colour and colour scheme.
 pub fn apply_with(ctx: &egui::Context, b: Brightness, accent: Accent, scheme: Scheme) {
+    if scheme == Scheme::Desktop {
+        crate::desktop_theme::watch(ctx);
+    }
     let t = Tokens::for_scheme(scheme, b, accent);
     ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, t));
     // egui keeps a style for each system theme and by default follows the system's setting. The
@@ -749,18 +862,70 @@ mod tests {
         }
     }
 
-    /// The contrast ratio of two opaque colors, from 1 (the same) to 21 (black on white), as WCAG 2
-    /// defines it.
-    fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
-        let luminance = |c: egui::Color32| {
-            let channel = |v: u8| {
-                let v = f32::from(v) / 255.0;
-                if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+    /// Desktop themes as the shells write them: dark with a pale primary, dark with a vivid one, a
+    /// light one, and a washed-out one whose surface step is missing.
+    fn sample_palettes() -> Vec<crate::desktop_theme::DesktopPalette> {
+        let p = |bg, fg, surface, primary| crate::desktop_theme::DesktopPalette {
+            background: bg,
+            foreground: fg,
+            surface,
+            primary,
+            danger: Some([0xeb, 0x6f, 0x92]),
+            warning: Some([0xf6, 0xc1, 0x77]),
         };
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        vec![
+            p([0x11, 0x0e, 0x08], [0xf1, 0xe4, 0xd1], Some([0x21, 0x1d, 0x16]), [0xe4, 0xc2, 0x87]),
+            p([0x19, 0x17, 0x24], [0xe0, 0xde, 0xf4], Some([0x30, 0x2d, 0x3e]), [0x9c, 0xcf, 0xd8]),
+            p([0x1a, 0x1b, 0x26], [0xc0, 0xca, 0xf5], None, [0x7a, 0xa2, 0xf7]),
+            p([0xfa, 0xf4, 0xed], [0x57, 0x52, 0x79], Some([0xf2, 0xe9, 0xe1]), [0xd7, 0x82, 0x7e]),
+            p([0xef, 0xf1, 0xf5], [0x4c, 0x4f, 0x69], None, [0xf9, 0xe2, 0xaf]),
+            p([0x80, 0x80, 0x80], [0x7c, 0x7c, 0x7c], Some([0x80, 0x80, 0x80]), [0x82, 0x82, 0x82]),
+        ]
+    }
+
+    /// Whatever the desktop theme, text reads on the panel, lettering reads on filled accents, and
+    /// the cards and slider rails stand out.
+    #[test]
+    fn desktop_themes_keep_the_ui_readable() {
+        for palette in sample_palettes() {
+            let t = Tokens::desktop(&palette);
+            let what = format!("{palette:?}");
+            assert!(contrast(t.text, t.panel) >= 4.5, "{what}: text {}", contrast(t.text, t.panel));
+            assert!(contrast(t.text_dim, t.panel) >= 3.0, "{what}: dim text {}", contrast(t.text_dim, t.panel));
+            assert!(contrast(t.accent, t.panel) >= 2.9, "{what}: accent {}", contrast(t.accent, t.panel));
+            assert!(contrast(t.on_accent, t.accent) >= 3.0, "{what}: on the hovered accent {}", contrast(t.on_accent, t.accent));
+            assert!(contrast(t.on_accent, t.accent_strong) >= 4.5, "{what}: on strong accent {}", contrast(t.on_accent, t.accent_strong));
+            assert_ne!(t.app_bar, t.panel, "{what}: the cards need a frame");
+            assert!(contrast(t.button_border, t.panel) >= 1.5, "{what}: slider rail {}", contrast(t.button_border, t.panel));
+            assert!(contrast(t.text, t.input) >= 4.5, "{what}: text in fields {}", contrast(t.text, t.input));
+        }
+    }
+
+    /// The desktop scheme changes the colours, not the shape of the interface.
+    #[test]
+    fn desktop_scheme_keeps_the_metrics_and_document_colors() {
+        for palette in sample_palettes() {
+            let (t, modern) = (
+                Tokens::desktop(&palette),
+                Tokens::for_brightness(if Tokens::desktop(&palette).dark { Brightness::MediumDark } else { Brightness::Light }),
+            );
+            assert_eq!((t.radius, t.font_size), (modern.radius, modern.font_size));
+            assert_eq!(
+                (t.guide, t.smart_guide, t.selection, t.bleed, t.axis_x),
+                (modern.guide, modern.smart_guide, modern.selection, modern.bleed, modern.axis_x)
+            );
+        }
+        assert_eq!(Scheme::parse("desktop"), Some(Scheme::Desktop));
+    }
+
+    /// Existing schemes keep white lettering on their accents.
+    #[test]
+    fn modern_and_classic_keep_white_on_their_accents() {
+        for b in Brightness::ALL {
+            for scheme in [Scheme::Modern, Scheme::Classic] {
+                assert_eq!(Tokens::for_scheme(scheme, b, Accent::Amber).on_accent, Color32::WHITE);
+            }
+        }
     }
 
     /// Changing brightness keeps the interface settings made after the theme was applied, such as
